@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using System.Xml;
+using System.Xml.Linq;
 
 namespace SalesforceBulkAPI
 {
@@ -17,12 +18,10 @@ namespace SalesforceBulkAPI
         private string userName = "ramon.prades@gmail.com";
         private string password = "Sinosuke01";
         private string token = "AH17f4hByqxR0hZj7ctuF1WQ";
-
-        private string createUrl = "my.salesforce.com/services/async/44.0/job";
-        private string instance;
+        private int maxTimes = 10;
+        private int timeOut = 5000;
+        private string baseUrl = "{instance}my.salesforce.com/services/async/44.0/job";
         private string sessionId;
-        private string jobId;
-        private string batchId;
         private string queryString;
         private string objectName;
 
@@ -48,189 +47,143 @@ namespace SalesforceBulkAPI
 
         public void Connect()
         {
-            // Login using username and password to retrieve sessionId and serverUrl
-            Task task1 = LogIn();
-            task1.Wait();
+            try
+            {
+                // Paso 1: Login
+                Task task1 = Login();
+                task1.Wait();
 
-            // Now creates the job
-            Task task2 = CreateJob();
-            task2.Wait();
+                // Paso 2: Crear el job
+                string url = this.baseUrl;
+                string content = BuildCreateJobBody();
+                Task<XmlDocument> task2 = SendRequest(HttpMethod.Post, url, content, "application/xml");
+                task2.Wait();
+                XmlDocument doc2 = task2.Result;
+                var node2 = doc2.SelectSingleNode("//*[local-name() = 'id']");
+                string jobId = node2.InnerText;
 
-            // Launches the query
-            Task task3 = LaunchQuery();
-            task3.Wait();
+                // Paso 3: Lanza la query
+                url = this.baseUrl + "/" + jobId + "/batch";
+                Task<XmlDocument> task3 = SendRequest(HttpMethod.Post, url, this.queryString, "text/csv");
+                task3.Wait();
+                XmlDocument doc3 = task3.Result;
+                var node3 = doc3.SelectSingleNode("//*[local-name() = 'id']");
+                string batchId = node3.InnerText;
 
-            // CHeck completed
-            Task task4 = CheckCompletion();
-            task4.Wait();
+                // Paso 4: Espera a que el job esté completo
+                url = this.baseUrl + "/" + jobId + "/batch/" + batchId;
+                int times = this.maxTimes;
+                while (times > 0) {
+                    Task<XmlDocument> task4 = SendRequest(HttpMethod.Get, url, String.Empty, "text/csv");
+                    task4.Wait();
+                    XmlDocument doc4 = task4.Result;
+                    var node4 = doc4.SelectSingleNode("//*[local-name() = 'state']");
+                    string state = node4.InnerText;
+                    if (state.ToLower() == "completed")
+                    {
+                        times = 0;
+                    } else
+                    {
+                        System.Threading.Thread.Sleep(this.timeOut);
+                    }
+                    times--;
+                }
 
+                // Paso 5: Busca el ID del resultado
+                url = url + "/result";
+                Task<XmlDocument> task5 = SendRequest(HttpMethod.Get, url, String.Empty, "text/csv");
+                task5.Wait();
+                XmlDocument doc5 = task5.Result;
+                var node5 = doc5.SelectSingleNode("//*[local-name() = 'result']");
+                string resultId = node5.InnerText;
+
+                // Paso 6: Lee el resultado
+                url = url + "/" + resultId;
+                Task<XmlDocument> task6 = SendRequest(HttpMethod.Get, url, String.Empty, "text/csv", false);
+                task6.Wait();
+                XmlDocument doc6 = task5.Result;
+                //var node5 = doc5.SelectSingleNode("//*[local-name() = 'result']");
+                //string resultId = node5.InnerText;
+
+                // Paso 7: Cierra el job
+                url = this.baseUrl + "/" + jobId;
+                content = BuildCloseJobBody();
+                Task<XmlDocument> task7 = SendRequest(HttpMethod.Post, url, content, "application/xml");
+                task7.Wait();
+                XmlDocument doc7 = task7.Result;
+                var node7 = doc7.SelectSingleNode("//*[local-name() = 'state']");            
+            }
+            catch (System.ApplicationException e)
+            {
+                throw e;
+            }           
          }
+
+        /**
+        * Prepara el cliente Http
+        */
+
+        private async Task<XmlDocument> SendRequest(HttpMethod method, string url, string content, string mediaType, bool convertToXml = true)
+        {
+            HttpClient client = this.BuildHttpClient();
+            HttpRequestMessage request = new HttpRequestMessage(method, url);
+            request.Headers.Add("X-SFDC-Session", this.sessionId);
+            if (!String.IsNullOrEmpty(content)) { 
+                request.Content = new StringContent(content, Encoding.UTF8, mediaType);
+            }
+            HttpResponseMessage response = await client.SendAsync(request);
+            var stream = await response.Content.ReadAsStreamAsync();
+            System.Collections.Generic.IEnumerable<string> valores = response.Content.Headers.GetValues("content-type");
+
+            StreamReader readStream = new StreamReader(stream, Encoding.UTF8);
+            var result = readStream.ReadToEnd();
+            var doc = new XmlDocument();
+            if (convertToXml)
+            {
+                doc.LoadXml(result);
+            } else {
+                string a = "b";
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                var errNode = doc.SelectSingleNode("//*[local-name() = 'exceptionMessage']");
+                throw new System.ApplicationException("Send Request: " + errNode.InnerText);
+            }            
+            return doc;
+        }
+
 
         /**
          * STEP 1: Log in
          */
-        private async Task LogIn()
+        private async Task Login()
         {
             HttpClient client = this.BuildHttpClient();
-
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, this.loginUrl);
             request.Headers.Add("SOAPAction", "login");
             request.Content = new StringContent(this.BuildLoginBody(), Encoding.UTF8, "text/xml");
-
             HttpResponseMessage response = await client.SendAsync(request);
-            if (!response.IsSuccessStatusCode) { 
-                throw new System.ApplicationException("SOAPAction login failed with status code " + response.StatusCode.ToString());
-            }
-
             var stream = await response.Content.ReadAsStreamAsync();
             StreamReader readStream = new StreamReader(stream, Encoding.UTF8);
             var result = readStream.ReadToEnd();
-            this.parseLogInResponse(result, ref this.instance, ref this.sessionId);
-        }
-
-        /**
-         * STEP 2: Create Job
-         */
-        private async Task CreateJob()
-        {
-            HttpClient client = this.BuildHttpClient();
-
-            string url = this.instance + this.createUrl;
-
-            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, url);
-            request.Headers.Add("X-SFDC-Session", this.sessionId);
-            request.Content = new StringContent(BuildCreateJobBody(), Encoding.UTF8, "application/xml");
-
-            HttpResponseMessage response = await client.SendAsync(request);
-            if (!response.IsSuccessStatusCode) {
-                throw new System.ApplicationException("CreateJob failed with status code " + response.StatusCode.ToString());
-            }
-
-            var stream = await response.Content.ReadAsStreamAsync();
-            StreamReader readStream = new StreamReader(stream, Encoding.UTF8);
-            var result = readStream.ReadToEnd();
-            this.parseCreateJobResponse(result, ref this.jobId);
-        }
-
-        /**
-         * STEP 3: Launch Query
-         */
-        private async Task LaunchQuery()
-        {
-            HttpClient client = this.BuildHttpClient();
-
-            string url = this.instance + this.createUrl + "/" + this.jobId + "/batch";
-
-            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, url);
-            request.Headers.Add("X-SFDC-Session", this.sessionId);
-            request.Content = new StringContent(this.queryString, Encoding.UTF8, "text/csv");
-
-            HttpResponseMessage response = await client.SendAsync(request);
+            var doc = new XmlDocument();
+            doc.LoadXml(result);
             if (!response.IsSuccessStatusCode)
             {
-                throw new System.ApplicationException("LaunchQuery failed with status code " + response.StatusCode.ToString());
+                var errNode = doc.SelectSingleNode("//*[local-name() = 'exceptionMessage']");
+                throw new System.ApplicationException("Login Error: " + errNode.InnerText);
             }
+            var node1 = doc.SelectSingleNode("//*[local-name() = 'sessionId']");
+            this.sessionId = node1.InnerText;
 
-            var stream = await response.Content.ReadAsStreamAsync();
-            StreamReader readStream = new StreamReader(stream, Encoding.UTF8);
-            var result = readStream.ReadToEnd();
-            this.parseLaunchQueryResponse(result, ref this.batchId);
-        }
+            var node2 = doc.SelectSingleNode("//*[local-name() = 'serverUrl']");
+            var instance = node2.InnerText;
+            int pos = instance.IndexOf("my.salesforce.com");
+            instance = instance.Substring(0, pos);
 
-        /**
-         * STEP 4: Check Completion
-         */
-        private async Task CheckCompletion()
-        {
-            HttpClient client = this.BuildHttpClient();
+            this.baseUrl = this.baseUrl.Replace("{instance}", instance);
 
-            string url = this.instance + this.createUrl + "/" + this.jobId + "/batch/" + this.batchId;
-
-            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("X-SFDC-Session", this.sessionId);
-            //request.Content = new StringContent(this.queryString, Encoding.UTF8, "text/csv");
-
-            HttpResponseMessage response = await client.SendAsync(request);
-            if (false && !response.IsSuccessStatusCode)
-            {
-                throw new System.ApplicationException("LaunchQuery failed with status code " + response.StatusCode.ToString());
-            }
-            var stream = await response.Content.ReadAsStreamAsync();
-            StreamReader readStream = new StreamReader(stream, Encoding.UTF8);
-            var result = readStream.ReadToEnd();
-            var state = "";
-                this.parseCheckCompletionResponse(result, ref state);
-        }
-
-
-
-        private void parseLogInResponse(string xmlString, ref string instance, ref string sessionId)
-        {
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlString);
-
-            var ns = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("force", "urn:partner.soap.sforce.com");
-            ns.AddNamespace("soapenv", "http://schemas.xmlsoap.org/soap/envelope/");
-
-            XmlNode serverNode = doc.SelectSingleNode("//force:serverUrl", ns);
-            if (serverNode != null)
-            {
-                string serverUrl = serverNode.InnerText;
-                int pos = serverUrl.IndexOf("my.salesforce.com");
-                instance = serverUrl.Substring(0, pos);
-            }
-
-            XmlNode sessionNode = doc.SelectSingleNode("//force:sessionId", ns);
-            if (sessionNode != null) sessionId = sessionNode.InnerText;
-
-        }
-
-        private void parseCreateJobResponse(string xmlString, ref string jobId)
-        {
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlString);
-
-            var ns = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("api", "http://www.force.com/2009/06/asyncapi/dataload");
-
-            XmlNode node= doc.SelectSingleNode("//api:jobInfo/api:id", ns);
-            if (node != null)
-            {
-                jobId = node.InnerText;
-            }
-        }
-
-        private void parseLaunchQueryResponse(string xmlString, ref string batchId)
-        {
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlString);
-
-            var ns = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("api", "http://www.force.com/2009/06/asyncapi/dataload");
-
-            XmlNode node = doc.SelectSingleNode("//api:batchInfo/api:id", ns);
-            if (node != null)
-            {
-                batchId = node.InnerText;
-            }
-        }
-
-        private void parseCheckCompletionResponse(string xmlString, ref string state)
-        {
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlString);
-
-            var ns = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("api", "http://www.force.com/2009/06/asyncapi/dataload");
-
-            XmlNode node = doc.SelectSingleNode("//api:batchInfo/api:state", ns);
-            if (node != null)
-            {
-                state = node.InnerText;
-            }
-        }
-
+        } // Login
 
         private HttpClient BuildHttpClient()
         {
@@ -270,6 +223,15 @@ namespace SalesforceBulkAPI
             return content;
         }
 
+        private string BuildCloseJobBody()
+        {
+            string content = "<?xml version='1.0' encoding='UTF-8'?>";
+            content += "<jobInfo xmlns='http://www.force.com/2009/06/asyncapi/dataload'>";
+            content += "<state>Closed</state>";
+            content += "</jobInfo>";
+
+            return content;
+        }
 
     }
 }
